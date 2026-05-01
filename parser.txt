@@ -1,0 +1,987 @@
+// ================================================================
+//  HOW THIS PARSER WORKS — READ THIS FIRST
+//
+//  This parser uses two things to build the tree:
+//
+//  1. RECURSIVE DESCENT
+//     Every grammar rule becomes one function.
+//     The function looks at the current token, decides which
+//     grammar alternative applies, then calls match() and other
+//     rule-functions in the correct order.
+//
+//  2. AN AST STACK
+//     We maintain a stack of ASTNode pointers.
+//     - When we see a real value (identifier, number, string),
+//       we push a LEAF node onto the stack.
+//     - When a grammar rule finishes and has a => label,
+//       we pop its child nodes off the stack, create a new
+//       parent node, attach those children, and push the parent.
+//     - At the very end, exactly one node remains: the AST root.
+//
+//  EXAMPLE: parsing  x = 5
+//    1. Vl() sees identifier x  → pushes leaf <ID:x>
+//       stack: [ <ID:x> ]
+//    2. match("=") consumes the = sign
+//    3. E() → ... → Rn() sees integer 5 → pushes leaf <INT:5>
+//       stack: [ <ID:x>  <INT:5> ]
+//    4. buildTree("=", 2) pops 2 items, makes =(x,5), pushes it
+//       stack: [ =(x,5) ]
+// ================================================================
+
+
+
+// ================================================================
+//  HELPER: isStartOfRn()
+//
+//  Returns true if the current token is something that can
+//  legally begin an Rn (a rand — the right-hand side of
+//  function application).
+//
+//  Why we need this:
+//    In R(), after parsing the function part, we need to keep
+//    parsing arguments as long as more arguments follow.
+//    We check: "can the current token start an Rn?"
+//    If yes → it's another argument → parse it and make gamma.
+//    If no  → no more arguments → stop the loop.
+//
+//  Tokens that can start an Rn:
+//    IDENTIFIER  — a variable name like x or Print
+//    INTEGER     — a number like 5 or 42
+//    STRING      — a string like 'hello'
+//    true/false/nil/dummy — keyword literals
+//    (           — a parenthesised expression like (x+1)
+// ================================================================
+bool Parser::isStartOfRn() {
+    Token& t = current();
+
+    if (t.type == IDENTIFIER) return true;
+    if (t.type == INTEGER)    return true;
+    if (t.type == STRING)     return true;
+
+    // These four keywords are values, not structural keywords
+    if (t.type == KEYWORD &&
+        (t.value == "true"  ||
+         t.value == "false" ||
+         t.value == "nil"   ||
+         t.value == "dummy"))
+        return true;
+
+    // An open bracket starts a parenthesised expression
+    if (t.type == PUNCTUATION && t.value == "(") return true;
+
+    return false;
+}
+
+
+// ================================================================
+//  GRAMMAR RULE FUNCTIONS
+//  One function per grammar rule, written bottom-up.
+//  (simpler/lower-level rules first, top-level rules last)
+// ================================================================
+
+
+// ----------------------------------------------------------------
+//  Rn — Rators and Rands (the leaf-level values)
+//
+//  Grammar:
+//    Rn -> '<IDENTIFIER>'
+//        | '<INTEGER>'
+//        | '<STRING>'
+//        | 'true'   => 'true'
+//        | 'false'  => 'false'
+//        | 'nil'    => 'nil'
+//        | 'dummy'  => 'dummy'
+//        | '(' E ')'
+//
+//  This function handles the LEAVES of the expression tree.
+//  For identifiers, integers, and strings: push a leaf node.
+//  For true/false/nil/dummy: push a node with that label.
+//  For ( E ): parse E (which handles pushing its own node).
+// ----------------------------------------------------------------
+void Parser::Rn() {
+    Token& t = current();
+
+    if (t.type == IDENTIFIER) {
+        // Push a leaf node labelled <ID> with the variable name as value
+        // e.g. identifier "x" → pushes ASTNode("<ID>", "x")
+        stack.push_back(new ASTNode("<ID>", t.value));
+        pos++;  // consume the identifier token
+
+    } else if (t.type == INTEGER) {
+        // Push a leaf node labelled <INT> with the number as value
+        // e.g. number 42 → pushes ASTNode("<INT>", "42")
+        stack.push_back(new ASTNode("<INT>", t.value));
+        pos++;  // consume the integer token
+
+    } else if (t.type == STRING) {
+        // Push a leaf node labelled <STR> with the string as value
+        // e.g. 'hello' → pushes ASTNode("<STR>", "'hello'")
+        stack.push_back(new ASTNode("<STR>", t.value));
+        pos++;  // consume the string token
+
+    } else if (t.type == KEYWORD && t.value == "true") {
+        // 'true' is a value in RPAL, not just a structural word
+        // Push an internal node labelled "true" with no children
+        stack.push_back(new ASTNode("true"));
+        pos++;
+
+    } else if (t.type == KEYWORD && t.value == "false") {
+        stack.push_back(new ASTNode("false"));
+        pos++;
+
+    } else if (t.type == KEYWORD && t.value == "nil") {
+        // 'nil' represents the empty list
+        stack.push_back(new ASTNode("nil"));
+        pos++;
+
+    } else if (t.type == KEYWORD && t.value == "dummy") {
+        stack.push_back(new ASTNode("dummy"));
+        pos++;
+
+    } else if (t.type == PUNCTUATION && t.value == "(") {
+        // Parenthesised expression: ( E )
+        // We just parse the inner expression — E() pushes its own node
+        // The parentheses are structural only, not part of the tree
+        match("(");  // consume the opening bracket
+        E();         // parse the inner expression (pushes one node)
+        match(")");  // consume the closing bracket
+        // No buildTree call needed — E already left its node on the stack
+
+    } else {
+        // None of the above matched — this is a syntax error
+        cerr << "Syntax Error in Rn: unexpected token '"
+             << t.value << "'" << endl;
+        exit(1);
+    }
+}
+
+
+// ----------------------------------------------------------------
+//  R — Function application (rator applied to rands)
+//
+//  Grammar:
+//    R -> R Rn  => 'gamma'
+//       | Rn
+//
+//  This rule is LEFT-RECURSIVE (R appears on left of R Rn).
+//  We CANNOT implement left recursion as a direct recursive call
+//  because it would loop forever: R() calls R() calls R()...
+//  Instead we convert it to a LOOP.
+//
+//  What 'gamma' means: it is function application.
+//    f x     → gamma(f, x)
+//    f x y   → gamma(gamma(f, x), y)
+//    f x y z → gamma(gamma(gamma(f, x), y), z)
+//
+//  The loop keeps applying left-to-right as long as the next
+//  token can be an argument (isStartOfRn() returns true).
+// ----------------------------------------------------------------
+void Parser::R() {
+    // Always parse at least one Rn first
+    // This handles both: just "f" alone, and "f x" with arguments
+    Rn();
+
+    // Keep looping as long as the next token can start another Rn
+    // Each iteration represents one more function argument
+    while (isStartOfRn()) {
+        Rn();                  // parse the next argument
+        buildTree("gamma", 2); // combine: gamma(function, argument)
+        // After buildTree, the stack has one gamma node instead of two
+        // That gamma node becomes the new "function" for the next iteration
+        // This is how  f x y  becomes  gamma(gamma(f,x), y)
+    }
+}
+
+
+// ----------------------------------------------------------------
+//  Ap — Infix method application using '@'
+//
+//  Grammar:
+//    Ap -> Ap '@' '<IDENTIFIER>' R  => '@'
+//        | R
+//
+//  LEFT-RECURSIVE → converted to a LOOP.
+//
+//  The '@' operator is used for infix method calls in RPAL.
+//  e.g.  list @ Head  means  Head(list)
+//
+//  The '@' node has 3 children:
+//    1. the object (left side)
+//    2. the method name (identifier after @)
+//    3. the argument (the R on the right)
+// ----------------------------------------------------------------
+void Parser::Ap() {
+    R();  // parse the base (could be object or just a plain R)
+
+    // Keep looping while we see more '@' operators
+    while (current().type == OPERATOR && current().value == "@") {
+        pos++;  // consume the '@' token
+
+        // The token immediately after '@' must be an identifier (method name)
+        if (current().type != IDENTIFIER) {
+            cerr << "Syntax Error in Ap: expected IDENTIFIER after '@'" << endl;
+            exit(1);
+        }
+        // Push the method name as an identifier leaf node
+        stack.push_back(new ASTNode("<ID>", current().value));
+        pos++;  // consume the method name identifier
+
+        R();  // parse the argument on the right side
+
+        // Build the '@' node with 3 children: object, method, argument
+        buildTree("@", 3);
+    }
+}
+
+
+// ----------------------------------------------------------------
+//  Af — Power operator
+//
+//  Grammar:
+//    Af -> Ap '**' Af  => '**'
+//        | Ap
+//
+//  RIGHT-ASSOCIATIVE — use RECURSION (not a loop).
+//  Right-associative means  2 ** 3 ** 4  equals  2 ** (3 ** 4)
+//  which means the RIGHT side is evaluated first.
+//
+//  The recursive call to Af() (not Ap()) is what makes it
+//  right-associative. Each call handles the rightmost ** first.
+// ----------------------------------------------------------------
+void Parser::Af() {
+    Ap();  // parse the left side
+
+    // Check if there is a '**' operator following
+    if (current().type == OPERATOR && current().value == "**") {
+        pos++;  // consume the '**' token
+
+        // Recursive call to Af (NOT Ap!) — this is what makes
+        // it right-associative.  2 ** 3 ** 4 → 2 ** (3 ** 4)
+        Af();
+
+        // Build the '**' node with 2 children: left and right
+        buildTree("**", 2);
+    }
+    // If no '**' found, just leave Ap's node on the stack as-is
+}
+
+
+// ----------------------------------------------------------------
+//  At — Multiplication and division
+//
+//  Grammar:
+//    At -> At '*' Af  => '*'
+//        | At '/' Af  => '/'
+//        | Af
+//
+//  LEFT-RECURSIVE → converted to a LOOP.
+//  Left-associative means  6 / 3 / 2  equals  (6 / 3) / 2
+// ----------------------------------------------------------------
+void Parser::At() {
+    Af();  // parse the first operand
+
+    // Keep looping while we see '*' or '/' operators
+    while (current().type == OPERATOR &&
+           (current().value == "*" || current().value == "/")) {
+
+        string op = current().value;  // remember whether it is * or /
+        pos++;  // consume the operator
+
+        Af();  // parse the right operand
+
+        // Build the '*' or '/' node with 2 children
+        buildTree(op, 2);
+        // The result node is now on the stack and becomes the
+        // left operand for the next iteration (left-associative)
+    }
+}
+
+
+// ----------------------------------------------------------------
+//  A — Addition, subtraction, and unary plus/minus
+//
+//  Grammar:
+//    A -> A '+' At  => '+'
+//       | A '-' At  => '-'
+//       | '+' At            (unary plus — NO tree node created)
+//       | '-' At  => 'neg'  (unary negation)
+//       | At
+//
+//  We handle the unary +/- FIRST before the binary loop.
+//  Unary '+' does nothing (no node in the grammar).
+//  Unary '-' creates a 'neg' node with one child.
+//  Then we loop for binary + and - (left-associative).
+// ----------------------------------------------------------------
+void Parser::A() {
+    if (current().type == OPERATOR && current().value == "+") {
+        // Unary plus: consume the '+' and parse At
+        pos++;   // consume unary '+'
+        At();    // parse the operand after it
+        // Grammar says no tree node is created for unary plus
+        // So we just leave At's result on the stack as-is
+
+    } else if (current().type == OPERATOR && current().value == "-") {
+        // Unary minus: consume '-' and create a 'neg' node
+        pos++;   // consume unary '-'
+        At();    // parse the operand after it
+        buildTree("neg", 1);  // neg node with one child
+
+    } else {
+        // No unary operator — just parse At normally
+        At();
+    }
+
+    // Now handle binary + and - in a left-to-right loop
+    while (current().type == OPERATOR &&
+           (current().value == "+" || current().value == "-")) {
+
+        string op = current().value;  // remember + or -
+        pos++;  // consume the operator
+
+        At();  // parse the right operand
+
+        buildTree(op, 2);  // build '+' or '-' node with 2 children
+    }
+}
+
+
+// ----------------------------------------------------------------
+//  Bp — Comparison operators
+//
+//  Grammar:
+//    Bp -> A ('gr'|'>') A   => 'gr'
+//        | A ('ge'|'>=') A  => 'ge'
+//        | A ('ls'|'<')  A  => 'ls'
+//        | A ('le'|'<=') A  => 'le'
+//        | A 'eq' A         => 'eq'
+//        | A 'ne' A         => 'ne'
+//        | A
+//
+//  Comparisons are NOT left-recursive — each one is just
+//  exactly two A expressions with one operator between them.
+//  So there is no loop here, just one if-else chain.
+//
+//  Note: RPAL allows both symbol form (> >= < <=) and
+//  keyword form (gr ge ls le) for comparisons.
+// ----------------------------------------------------------------
+void Parser::Bp() {
+    A();  // parse the left operand
+
+    // Check what the operator is and build the right node
+    Token& t = current();
+
+    if ((t.type == KEYWORD  && t.value == "gr") ||
+        (t.type == OPERATOR && t.value == ">")) {
+        // Greater than: A gr A  or  A > A
+        pos++;          // consume the operator
+        A();            // parse the right operand
+        buildTree("gr", 2);
+
+    } else if ((t.type == KEYWORD  && t.value == "ge") ||
+               (t.type == OPERATOR && t.value == ">=")) {
+        // Greater than or equal
+        pos++;
+        A();
+        buildTree("ge", 2);
+
+    } else if ((t.type == KEYWORD  && t.value == "ls") ||
+               (t.type == OPERATOR && t.value == "<")) {
+        // Less than
+        pos++;
+        A();
+        buildTree("ls", 2);
+
+    } else if ((t.type == KEYWORD  && t.value == "le") ||
+               (t.type == OPERATOR && t.value == "<=")) {
+        // Less than or equal
+        pos++;
+        A();
+        buildTree("le", 2);
+
+    } else if (t.type == KEYWORD && t.value == "eq") {
+        // Equal
+        pos++;
+        A();
+        buildTree("eq", 2);
+
+    } else if (t.type == KEYWORD && t.value == "ne") {
+        // Not equal
+        pos++;
+        A();
+        buildTree("ne", 2);
+    }
+    // If none of the above: just A, leave its node on the stack
+}
+
+
+// ----------------------------------------------------------------
+//  Bs — Logical NOT
+//
+//  Grammar:
+//    Bs -> 'not' Bp  => 'not'
+//        | Bp
+//
+//  Simple: if we see 'not', consume it, parse Bp, build 'not' node.
+//  Otherwise just parse Bp.
+// ----------------------------------------------------------------
+void Parser::Bs() {
+    if (current().type == KEYWORD && current().value == "not") {
+        pos++;   // consume 'not'
+        Bp();    // parse the boolean expression being negated
+        buildTree("not", 1);  // 'not' node with one child
+    } else {
+        Bp();
+    }
+}
+
+
+// ----------------------------------------------------------------
+//  Bt — Logical AND
+//
+//  Grammar:
+//    Bt -> Bt '&' Bs  => '&'
+//        | Bs
+//
+//  LEFT-RECURSIVE → converted to a LOOP.
+//  e.g.  a & b & c  → &(&(a,b), c)
+// ----------------------------------------------------------------
+void Parser::Bt() {
+    Bs();  // parse the first operand
+
+    // Keep looping while we see '&' operators
+    while (current().type == OPERATOR && current().value == "&") {
+        pos++;   // consume '&'
+        Bs();    // parse the right operand
+        buildTree("&", 2);  // & node with 2 children
+    }
+}
+
+
+// ----------------------------------------------------------------
+//  B — Logical OR
+//
+//  Grammar:
+//    B -> B 'or' Bt  => 'or'
+//      | Bt
+//
+//  LEFT-RECURSIVE → converted to a LOOP.
+//  e.g.  a or b or c  → or(or(a,b), c)
+// ----------------------------------------------------------------
+void Parser::B() {
+    Bt();  // parse the first operand
+
+    // Keep looping while we see 'or' keyword
+    while (current().type == KEYWORD && current().value == "or") {
+        pos++;   // consume 'or'
+        Bt();    // parse the right operand
+        buildTree("or", 2);  // 'or' node with 2 children
+    }
+}
+
+
+// ----------------------------------------------------------------
+//  Tc — Conditional expression (if-then-else)
+//
+//  Grammar:
+//    Tc -> B '->' Tc '|' Tc  => '->'
+//        | B
+//
+//  RIGHT-ASSOCIATIVE → use RECURSION.
+//  The '->' node always has exactly 3 children:
+//    child 0: the condition (a B expression)
+//    child 1: the then-branch (what to return if condition is true)
+//    child 2: the else-branch (what to return if condition is false)
+//
+//  e.g.  x > 0 -> 'positive' | 'negative'
+//  becomes:  ->( >(x,0),  'positive',  'negative' )
+// ----------------------------------------------------------------
+void Parser::Tc() {
+    B();  // parse the condition
+
+    // Check if there is a '->' following
+    if (current().type == OPERATOR && current().value == "->") {
+        pos++;   // consume '->'
+
+        Tc();    // parse the then-branch (recursive call for right-assoc)
+
+        match("|");  // the '|' separates then-branch from else-branch
+
+        Tc();    // parse the else-branch
+
+        // Build '->' node with 3 children: condition, then, else
+        buildTree("->", 3);
+    }
+    // If no '->' found: just B's result stays on the stack
+}
+
+
+// ----------------------------------------------------------------
+//  Ta — Tuple augmentation
+//
+//  Grammar:
+//    Ta -> Ta 'aug' Tc  => 'aug'
+//        | Tc
+//
+//  LEFT-RECURSIVE → converted to a LOOP.
+//  'aug' adds an element to a tuple.
+//  e.g.  (1,2) aug 3  →  aug((1,2), 3)
+// ----------------------------------------------------------------
+void Parser::Ta() {
+    Tc();  // parse the first part
+
+    // Keep looping while we see the 'aug' keyword
+    while (current().type == KEYWORD && current().value == "aug") {
+        pos++;   // consume 'aug'
+        Tc();    // parse the right side
+        buildTree("aug", 2);  // aug node with 2 children
+    }
+}
+
+
+// ----------------------------------------------------------------
+//  T — Tuple construction using commas
+//
+//  Grammar:
+//    T -> Ta (',' Ta)+  => 'tau'
+//       | Ta
+//
+//  'tau' is the tuple constructor node.
+//  It is ONLY created when there are 2 or more items.
+//  If there is just one Ta, we leave it on the stack as-is.
+//
+//  e.g.  1, 2, 3    → tau(1, 2, 3)    — creates tau node
+//        1           → just 1           — no tau node
+// ----------------------------------------------------------------
+void Parser::T() {
+    Ta();      // always parse at least one Ta
+    int count = 1;  // count how many items we have parsed
+
+    // Keep looping while we see comma separators
+    while (current().type == PUNCTUATION && current().value == ",") {
+        pos++;   // consume the ',' separator
+        Ta();    // parse the next item
+        count++; // increment our item count
+    }
+
+    // Only create a tau node if we had 2 or more items
+    if (count > 1) {
+        buildTree("tau", count);  // tau node with `count` children
+    }
+    // If count == 1: Ta's node is already on the stack, nothing to do
+}
+
+
+// ----------------------------------------------------------------
+//  Ew — Where expression
+//
+//  Grammar:
+//    Ew -> T 'where' Dr  => 'where'
+//        | T
+//
+//  The 'where' keyword lets you attach a local definition to
+//  an expression. The 'where' node has 2 children:
+//    child 0: the body expression (the T part)
+//    child 1: the definition (the Dr part)
+//
+//  e.g.  x + y  where  y = 5
+//  becomes:  where( +(x,y),  =(y,5) )
+// ----------------------------------------------------------------
+void Parser::Ew() {
+    T();  // parse the main body expression
+
+    // Check if 'where' follows
+    if (current().type == KEYWORD && current().value == "where") {
+        pos++;   // consume 'where'
+        Dr();    // parse the local definition
+        buildTree("where", 2);  // where node: body, definition
+    }
+    // If no 'where': just T's result stays on the stack
+}
+
+
+// ----------------------------------------------------------------
+//  E — Top-level expression (entry point for all expressions)
+//
+//  Grammar:
+//    E -> 'let' D 'in' E   => 'let'
+//       | 'fn' Vb+ '.' E  => 'lambda'
+//       | Ew
+//
+//  We look at the first token to decide which alternative:
+//    'let'       → let expression
+//    'fn'        → lambda (anonymous function)
+//    anything else → falls through to Ew
+//
+//  'let' node has 2 children:
+//    child 0: the definition D
+//    child 1: the body E (where the definition is in scope)
+//
+//  'lambda' node has n+1 children:
+//    children 0..n-1: the parameter bindings (Vb nodes)
+//    child n:         the body E
+// ----------------------------------------------------------------
+void Parser::E() {
+    if (current().type == KEYWORD && current().value == "let") {
+        pos++;    // consume 'let'
+
+        D();      // parse the definition part  e.g. x = 5
+
+        match("in");  // consume 'in' (structural keyword, not a node)
+
+        E();      // parse the body expression  e.g. x + 1
+
+        // Build 'let' node: 2 children = definition + body
+        buildTree("let", 2);
+
+    } else if (current().type == KEYWORD && current().value == "fn") {
+        pos++;    // consume 'fn'
+
+        // Parse one or more Vb parameter bindings (the Vb+ part)
+        // We use a do-while to guarantee at least one Vb is parsed
+        int count = 0;
+        do {
+            Vb();    // parse one parameter binding
+            count++; // count how many parameters we parsed
+        } while (
+            // Keep going if the next token can start another Vb
+            // A Vb can start with an IDENTIFIER or with '('
+            current().type == IDENTIFIER ||
+            (current().type == PUNCTUATION && current().value == "(")
+        );
+
+        match(".");  // consume the '.' that separates params from body
+
+        E();  // parse the body expression
+
+        // Build 'lambda' node: count Vb nodes + 1 body = count+1 children
+        buildTree("lambda", count + 1);
+
+    } else {
+        // Not 'let' or 'fn' — fall through to Ew
+        Ew();
+    }
+}
+
+
+// ----------------------------------------------------------------
+//  Vl — Variable list (comma-separated identifiers)
+//
+//  Grammar:
+//    Vl -> '<IDENTIFIER>' (',' '<IDENTIFIER>')*
+//
+//  Used to declare multiple variable names in a definition.
+//
+//  If there is only ONE identifier: leave the <ID> leaf as-is.
+//  If there are TWO OR MORE: build a ',' node with all of them.
+//
+//  e.g.  x           → just <ID:x>  (no comma node)
+//        x, y        → ,(x, y)
+//        x, y, z     → ,(x, y, z)
+// ----------------------------------------------------------------
+void Parser::Vl() {
+    // The first token must be an identifier
+    if (current().type != IDENTIFIER) {
+        cerr << "Syntax Error in Vl: expected IDENTIFIER, got '"
+             << current().value << "'" << endl;
+        exit(1);
+    }
+
+    // Push the first identifier as a leaf node
+    stack.push_back(new ASTNode("<ID>", current().value));
+    pos++;  // consume the identifier
+    int count = 1;  // we have parsed one identifier so far
+
+    // Keep looping while we see ',' separators
+    while (current().type == PUNCTUATION && current().value == ",") {
+        pos++;  // consume the ','
+
+        // After a comma there must be another identifier
+        if (current().type != IDENTIFIER) {
+            cerr << "Syntax Error in Vl: expected IDENTIFIER after ','" << endl;
+            exit(1);
+        }
+
+        // Push this identifier as a leaf node
+        stack.push_back(new ASTNode("<ID>", current().value));
+        pos++;   // consume the identifier
+        count++; // increment count
+    }
+
+    // If we parsed more than one identifier, group them under ','
+    if (count > 1) {
+        buildTree(",", count);  // ',' node with all identifiers as children
+    }
+    // If count == 1: the single <ID> leaf is already on the stack
+}
+
+
+// ----------------------------------------------------------------
+//  Vb — Variable binding (a single parameter in a function)
+//
+//  Grammar:
+//    Vb -> '<IDENTIFIER>'
+//        | '(' Vl ')'
+//        | '(' ')'     => '()'
+//
+//  Used in function definitions to specify what parameters look like.
+//
+//  Three forms:
+//    x         → a single identifier parameter → <ID:x>
+//    (x, y)    → a tuple parameter → ,(x, y)
+//    ()        → zero-argument marker → () node
+//
+//  Examples:
+//    fn x . body        → Vb is just x
+//    fn (x,y) . body    → Vb is (x,y) — a tuple parameter
+//    fn () . body       → Vb is ()     — takes no argument
+// ----------------------------------------------------------------
+void Parser::Vb() {
+    if (current().type == IDENTIFIER) {
+        // Simple single-identifier parameter
+        stack.push_back(new ASTNode("<ID>", current().value));
+        pos++;  // consume the identifier
+
+    } else if (current().type == PUNCTUATION && current().value == "(") {
+        pos++;  // consume the '('
+
+        if (current().type == PUNCTUATION && current().value == ")") {
+            // We found () — empty parameter list
+            pos++;  // consume the ')'
+            // Build an '()' node with ZERO children
+            // This signals: this function takes no arguments
+            buildTree("()", 0);
+
+        } else {
+            // We found ( Vl ) — a tuple of parameter names
+            Vl();     // parse the variable list inside the brackets
+            match(")"); // consume the closing ')'
+            // Vl already put its node on the stack, nothing more to do
+        }
+
+    } else {
+        cerr << "Syntax Error in Vb: expected IDENTIFIER or '(', got '"
+             << current().value << "'" << endl;
+        exit(1);
+    }
+}
+
+
+// ----------------------------------------------------------------
+//  Db — Definition body (the core of a definition)
+//
+//  Grammar:
+//    Db -> Vl '=' E                     => '='        (simple binding)
+//        | '<IDENTIFIER>' Vb+ '=' E     => 'fcn_form' (function def)
+//        | '(' D ')'
+//
+//  This is the trickiest function because two alternatives
+//  both start with an identifier. We use LOOKAHEAD to decide:
+//
+//    Look at the token AFTER the current identifier:
+//      If it is an IDENTIFIER or '('  →  fcn_form (has parameters)
+//      If it is '=' or ','            →  Vl = E   (simple binding)
+//
+//  '=' node has 2 children:
+//    child 0: the variable name(s) — Vl
+//    child 1: the value expression — E
+//
+//  'fcn_form' node has n+2 children:
+//    child 0:    the function name — identifier
+//    child 1..n: the parameters   — Vb nodes
+//    child n+1:  the body         — E
+//
+//  Examples:
+//    x = 5           →  '='(x, 5)               simple binding
+//    f x = x+1       →  fcn_form(f, x, +(x,1))  function def
+//    f (x,y) = x+y   →  fcn_form(f, (x,y), +)   tuple param
+// ----------------------------------------------------------------
+void Parser::Db() {
+    if (current().type == PUNCTUATION && current().value == "(") {
+        // Grouped definition: ( D )
+        // Used to group multiple definitions together
+        pos++;    // consume '('
+        D();      // parse the definition inside
+        match(")"); // consume ')'
+        // D already put its node on the stack
+
+    } else if (current().type == IDENTIFIER) {
+
+        // We have an identifier — now check one token ahead
+        // to decide: simple binding or function definition?
+        Token& next = lookahead(1);
+
+        // If what follows the identifier is another identifier or '('
+        // then this is a function definition with parameters
+        bool isFcnForm =
+            (next.type == IDENTIFIER) ||
+            (next.type == PUNCTUATION && next.value == "(");
+
+        if (isFcnForm) {
+            // FUNCTION DEFINITION: '<IDENTIFIER>' Vb+ '=' E  => 'fcn_form'
+            //
+            // Push the function name as the first child
+            stack.push_back(new ASTNode("<ID>", current().value));
+            pos++;  // consume the function name identifier
+
+            int count = 1;  // start at 1 for the function name itself
+
+            // Parse one or more Vb parameter bindings
+            do {
+                Vb();    // parse one parameter binding
+                count++; // count it
+            } while (
+                // Keep going while next token can start another Vb
+                current().type == IDENTIFIER ||
+                (current().type == PUNCTUATION && current().value == "(")
+            );
+
+            match("=");  // consume the '=' between params and body
+
+            E();     // parse the body expression
+            count++; // +1 for the body
+
+            // Build 'fcn_form': name + params + body
+            buildTree("fcn_form", count);
+
+        } else {
+            // SIMPLE BINDING: Vl '=' E  => '='
+            //
+            // Parse the left-hand side (variable name or tuple of names)
+            Vl();
+
+            match("=");  // consume the '='
+
+            E();  // parse the right-hand side value expression
+
+            // Build '=' node with 2 children: name(s) and value
+            buildTree("=", 2);
+        }
+
+    } else {
+        cerr << "Syntax Error in Db: unexpected token '"
+             << current().value << "'" << endl;
+        exit(1);
+    }
+}
+
+
+// ----------------------------------------------------------------
+//  Dr — Recursive definition
+//
+//  Grammar:
+//    Dr -> 'rec' Db  => 'rec'
+//        | Db
+//
+//  'rec' is used to define recursive functions.
+//  e.g.  rec f x = ... f ...  — f can call itself
+//
+//  'rec' node has exactly 1 child: the Db definition inside it.
+// ----------------------------------------------------------------
+void Parser::Dr() {
+    if (current().type == KEYWORD && current().value == "rec") {
+        pos++;   // consume 'rec'
+        Db();    // parse the definition body
+        buildTree("rec", 1);  // 'rec' node wrapping the definition
+    } else {
+        Db();    // not recursive — just parse Db directly
+    }
+}
+
+
+// ----------------------------------------------------------------
+//  Da — Multiple simultaneous definitions using 'and'
+//
+//  Grammar:
+//    Da -> Dr ('and' Dr)+  => 'and'
+//        | Dr
+//
+//  'and' lets you define multiple things at the same time.
+//  e.g.  f x = x + 1 and g x = x * 2
+//  becomes:  and( fcn_form(f,...),  fcn_form(g,...) )
+//
+//  'and' node is only created if there are 2 or more definitions.
+// ----------------------------------------------------------------
+void Parser::Da() {
+    Dr();       // always parse at least one Dr
+    int count = 1;
+
+    // Keep looping while we see 'and' keywords
+    while (current().type == KEYWORD && current().value == "and") {
+        pos++;   // consume 'and'
+        Dr();    // parse the next definition
+        count++;
+    }
+
+    // Only build 'and' node if there were multiple definitions
+    if (count > 1) {
+        buildTree("and", count);
+    }
+    // If count == 1: Dr's node is already on the stack
+}
+
+
+// ----------------------------------------------------------------
+//  D — Top-level definition (entry point for definitions)
+//
+//  Grammar:
+//    D -> Da 'within' D  => 'within'
+//       | Da
+//
+//  'within' creates nested scope:
+//    the first definition is in scope inside the second one.
+//
+//  'within' node has 2 children:
+//    child 0: the outer definition Da
+//    child 1: the inner definition D
+// ----------------------------------------------------------------
+void Parser::D() {
+    Da();  // parse the first definition block
+
+    // Check if 'within' follows
+    if (current().type == KEYWORD && current().value == "within") {
+        pos++;  // consume 'within'
+        D();    // parse the nested definition (recursive)
+        buildTree("within", 2);  // within node: outer, inner
+    }
+    // If no 'within': Da's node stays on the stack as-is
+}
+
+
+// ================================================================
+//  parse() — PUBLIC ENTRY POINT
+//
+//  Call this from your main file to run the parser.
+//
+//  What it does:
+//    1. Calls E() to parse the complete program
+//    2. Checks that ALL tokens were consumed
+//       (if tokens remain, there is a syntax error)
+//    3. Checks that the stack has EXACTLY ONE item
+//       (if not, something went wrong internally)
+//    4. Returns that one item as the root of the complete AST
+// ================================================================
+ASTNode* Parser::parse() {
+    // Parse the entire program starting from the top-level rule E
+    E();
+
+    // After parsing, ALL tokens should have been consumed
+    // If pos has not reached the end, there are leftover tokens
+    if (pos < (int)tokens.size()) {
+        cerr << "Syntax Error: unexpected token '"
+             << current().value
+             << "' found after end of program." << endl;
+        exit(1);
+    }
+
+    // The stack should have exactly ONE item — the complete AST root
+    // If it has more, something went wrong with our buildTree logic
+    if (stack.size() != 1) {
+        cerr << "Internal Parser Error: stack has "
+             << stack.size()
+             << " items but expected exactly 1." << endl;
+        exit(1);
+    }
+
+    // Return the single remaining item — this is the AST root
+    return stack[0];
+}
