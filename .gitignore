@@ -1,0 +1,26 @@
+# Build artifacts
+rpal20
+*.o
+src/*.o
+
+# Generated test output
+tests/actual/
+
+# Generated packages
+rpal20_submission.zip
+*.zip
+*.tar
+*.tar.gz
+
+# Keep reference expected outputs trackable.
+!tests/expected/*.out
+
+# macOS / editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.log
+*~
