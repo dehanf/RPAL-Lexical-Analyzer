@@ -1,0 +1,1 @@
+(Print(FizzBuzz Y) where FizzBuzz x = x rem 0 -> 'Negative' | (x eq 0 -> 'Zero' | 'Positive')) where Y = 15

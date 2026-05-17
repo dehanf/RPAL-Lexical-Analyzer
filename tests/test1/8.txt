@@ -1,0 +1,5 @@
+let FizzBuzz x = (x / 3)*3 eq x  -> ( (x / 5)*5 eq x -> 'FizzBuzz' | 'Fizz') | ( (x / 5)*5 eq x -> 'Buzz' | x) 
+in
+let rec FBMachine y = y eq 0 -> Print(y) | (Print(FizzBuzz y), Print(' '), z = (y -1) in (FBMachine (y-1) ))
+in 
+(FBMachine 15)

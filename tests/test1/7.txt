@@ -1,0 +1,3 @@
+let rec OddEven N = N eq 0 -> 'Even' | N eq 1 -> 'Odd' | OddEven (N-2)
+in
+Print(OddEven 5)

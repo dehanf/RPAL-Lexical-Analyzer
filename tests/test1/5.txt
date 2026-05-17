@@ -1,0 +1,5 @@
+let rec Reverse (N, Acc) = N eq 0 -> Acc | Reverse (N / 10, Acc * 10 + N - (N / 10) * 10)
+in
+let IsPalindrome N = N eq Reverse (N, 0) -> 'Palindrome' | 'Not Palindrome'
+in
+Print(IsPalindrome 121)

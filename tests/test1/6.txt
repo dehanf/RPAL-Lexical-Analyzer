@@ -1,0 +1,7 @@
+let rec Rev S = S eq '' -> '' | Conc (Rev (Stern S)) (Stem S)
+in
+let IsPalin S = S eq Rev S -> true | false
+in
+let rec PalinRange (N, Max) = N gr Max -> nil | IsPalin (N) -> PalinRange(N+1, Max) aug N| PalinRange(N+1, Max)
+in
+Print(PalinRange(1, 200))

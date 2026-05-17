@@ -1,0 +1,6 @@
+let Max2 a b = a ls b -> b | a 
+in
+let Max3 x y z = x ls y -> (Max2 y z) | (Max2 x z)
+in 
+Print(Max3 1 7 4)
+

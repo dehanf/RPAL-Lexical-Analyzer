@@ -1,0 +1,5 @@
+let rec Fib N = N eq 0 -> 0 | N eq 1 -> 1 | Fib(N-1) + Fib(N-2)
+in
+let rec FibSeries (N, Max) = N gr Max -> nil | FibSeries(N+1, Max) aug Fib N
+in
+Print(FibSeries(0, 7))
